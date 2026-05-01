@@ -4,148 +4,229 @@ from sklearn.cluster import KMeans
 
 
 # ─────────────────────────────────────────────────────────────────
-# Distance functions
+# Distance utilities
 # ─────────────────────────────────────────────────────────────────
-def cosine_distance(a, b):
-    """Cosine distance in [0,2]. Works on pre-normalized or raw vectors."""
-    return 1.0 - np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+class DistanceMetrics:
+    """Static collection of distance functions."""
 
+    @staticmethod
+    def cosine(a: np.ndarray, b: np.ndarray) -> float:
+        """Cosine distance in [0, 2]. Works on pre-normalised or raw vectors."""
+        return 1.0 - float(np.dot(a, b)) / (
+            np.linalg.norm(a) * np.linalg.norm(b) + 1e-8
+        )
 
-def euclidean_distance(a, b):
-    """L2 distance — useful as a second signal for tie-breaking."""
-    return float(np.linalg.norm(a - b))
+    @staticmethod
+    def euclidean(a: np.ndarray, b: np.ndarray) -> float:
+        """L2 distance — useful as a secondary tie-breaking signal."""
+        return float(np.linalg.norm(a - b))
 
 
 # ─────────────────────────────────────────────────────────────────
-# Node for A* heap
+# Internal A* node
 # ─────────────────────────────────────────────────────────────────
-class Node:
-    def __init__(self, label, vector, g, h, node_type):
+class _AStarNode:
+    """Priority-queue node for the two-level A* search."""
+
+    __slots__ = ("label", "vector", "g", "h", "f", "node_type")
+
+    def __init__(
+        self,
+        label: str,
+        vector,
+        g: float,
+        h: float,
+        node_type: str,
+    ):
         self.label     = label
         self.vector    = vector
         self.g         = g
         self.h         = h
         self.f         = g + h
-        self.node_type = node_type  # "class" | "centroid"
+        self.node_type = node_type   # "class" | "centroid"
 
-    def __lt__(self, other):
+    def __lt__(self, other: "_AStarNode") -> bool:
         return self.f < other.f
 
 
 # ─────────────────────────────────────────────────────────────────
-# Build structures
+# Index builder
 # ─────────────────────────────────────────────────────────────────
-def create_class_prototypes(dataset):
-    """Mean vector per class — used as a fast prototype signal."""
-    return {label: np.mean(samples, axis=0) for label, samples in dataset.items()}
-
-
-def create_centroids(dataset, centroids_per_class=40, random_state=42):
+class SketchIndex:
     """
-    KMeans centroids per class.
-    40 centroids balances coverage vs speed for 30 classes × 1500 samples.
-    n_init=10 gives more stable clusters than the default 3.
+    Builds and stores the search structures (prototypes + centroids)
+    used for fast nearest-class lookup.
     """
-    if centroids_per_class <= 0:
-        raise ValueError("centroids_per_class must be positive")
 
-    centroids = {}
-    for label, samples in dataset.items():
-        k = min(centroids_per_class, len(samples))
-        km = KMeans(n_clusters=k, random_state=random_state, n_init=10)
-        km.fit(samples)
-        centroids[label] = km.cluster_centers_
-    return centroids
+    def __init__(self, centroids_per_class: int = 40, random_state: int = 42):
+        if centroids_per_class <= 0:
+            raise ValueError("centroids_per_class must be positive")
+        self.centroids_per_class = centroids_per_class
+        self.random_state        = random_state
+        self.prototypes: dict    = {}
+        self.centroids: dict     = {}
+
+    def fit(self, dataset: dict) -> "SketchIndex":
+        """
+        Compute prototypes and KMeans centroids from *dataset*.
+
+        Parameters
+        ----------
+        dataset : dict[str, np.ndarray]  – label → (N, D) float array
+        """
+        self.prototypes = self._build_prototypes(dataset)
+        self.centroids  = self._build_centroids(dataset)
+        return self
+
+    # ── Private builders ───────────────────────────────────────────
+    @staticmethod
+    def _build_prototypes(dataset: dict) -> dict:
+        return {label: np.mean(samples, axis=0) for label, samples in dataset.items()}
+
+    def _build_centroids(self, dataset: dict) -> dict:
+        """KMeans centroids per class."""
+        centroids = {}
+        for label, samples in dataset.items():
+            k  = min(self.centroids_per_class, len(samples))
+            km = KMeans(n_clusters=k, random_state=self.random_state, n_init=10)
+            km.fit(samples)
+            centroids[label] = km.cluster_centers_
+        return centroids
 
 
 # ─────────────────────────────────────────────────────────────────
-# A* Classification
+# Classifier
 # ─────────────────────────────────────────────────────────────────
+class SketchClassifier:
+    """
+    Two-level A* classifier + ensemble top-K ranker.
+
+    Parameters
+    ----------
+    index : SketchIndex  – fitted search index (prototypes + centroids)
+    """
+
+    def __init__(self, index: SketchIndex):
+        self.index = index
+
+    # ── Public API ─────────────────────────────────────────────────
+    def predict(self, input_vector: np.ndarray) -> tuple:
+        """
+        Return (label, distance) for the single best match.
+        Uses a two-level A* over the centroid graph.
+        """
+        return self._a_star(input_vector)
+
+    def predict_top_k(self, input_vector: np.ndarray, k: int = 3) -> list:
+        """
+        Return list of (label, distance) for the top-*k* matches.
+        Uses the Borda-count ensemble for higher accuracy.
+        """
+        return self._ensemble_top_k(input_vector, k)
+
+    # ── A* ─────────────────────────────────────────────────────────
+    def _a_star(self, input_vector: np.ndarray) -> tuple:
+        """
+        Two-level A* over (class → centroid).
+        Level-1 heuristic = min centroid distance (admissible).
+        First centroid node popped is globally optimal.
+        """
+        iv        = self._normalise(input_vector)
+        centroids = self.index.centroids
+        open_list = []
+
+        for label, cents in centroids.items():
+            h = float(min(DistanceMetrics.cosine(iv, c) for c in cents))
+            heapq.heappush(open_list, _AStarNode(label, None, 0.0, h, "class"))
+
+        while open_list:
+            cur = heapq.heappop(open_list)
+            if cur.node_type == "centroid":
+                return cur.label, cur.g
+            for cent in centroids[cur.label]:
+                g = float(DistanceMetrics.cosine(iv, cent))
+                heapq.heappush(open_list, _AStarNode(cur.label, cent, g, 0.0, "centroid"))
+
+        return None, float("inf")
+
+    # ── Ensemble top-K ─────────────────────────────────────────────
+    def _ensemble_top_k(self, input_vector: np.ndarray, k: int) -> list:
+        """
+        Combines three signals per class and rank-aggregates (Borda count):
+
+        1. Centroid score  – best (min) cosine distance to any centroid
+        2. Prototype score – cosine distance to the class mean vector
+        3. Top-5 mean      – average distance to the 5 nearest centroids
+
+        The class with the lowest total Borda rank is the best match.
+        Returns [(label, centroid_score), ...] for the top-k labels.
+        """
+        iv         = self._normalise(input_vector)
+        centroids  = self.index.centroids
+        prototypes = self.index.prototypes
+        labels     = list(centroids.keys())
+
+        centroid_scores:  dict = {}
+        prototype_scores: dict = {}
+        top5_mean_scores: dict = {}
+
+        for label in labels:
+            cents = centroids[label]
+            dists = sorted(DistanceMetrics.cosine(iv, c) for c in cents)
+
+            centroid_scores[label]  = dists[0]
+            prototype_scores[label] = DistanceMetrics.cosine(iv, prototypes[label])
+            top5_mean_scores[label] = float(np.mean(dists[:5]))
+
+        def ranks(score_dict: dict) -> dict:
+            sorted_labels = sorted(score_dict, key=score_dict.get)
+            return {lbl: i for i, lbl in enumerate(sorted_labels)}
+
+        r1 = ranks(centroid_scores)
+        r2 = ranks(prototype_scores)
+        r3 = ranks(top5_mean_scores)
+
+        borda         = {lbl: r1[lbl] + r2[lbl] + r3[lbl] for lbl in labels}
+        sorted_labels = sorted(borda, key=borda.get)
+        return [(lbl, centroid_scores[lbl]) for lbl in sorted_labels[:k]]
+
+    # ── Utility ────────────────────────────────────────────────────
+    @staticmethod
+    def _normalise(v: np.ndarray) -> np.ndarray:
+        return v / (np.linalg.norm(v) + 1e-8)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Module-level convenience wrappers (keep old call-sites working)
+# ─────────────────────────────────────────────────────────────────
+def create_class_prototypes(dataset: dict) -> dict:
+    return SketchIndex._build_prototypes(dataset)
+
+
+def create_centroids(dataset: dict, centroids_per_class: int = 40) -> dict:
+    idx = SketchIndex(centroids_per_class=centroids_per_class)
+    return idx._build_centroids(dataset)
+
+
+def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+    return DistanceMetrics.cosine(a, b)
+
+
+def euclidean_distance(a: np.ndarray, b: np.ndarray) -> float:
+    return DistanceMetrics.euclidean(a, b)
+
+
 def a_star_classification(input_vector, prototypes, centroids_dict):
-    """
-    Two-level A* over (class → centroid) graph.
-    Level-1 heuristic = min centroid distance (admissible).
-    First centroid node popped is globally optimal.
-    """
-    iv = input_vector / (np.linalg.norm(input_vector) + 1e-8)
-    open_list = []
-
-    for label, cents in centroids_dict.items():
-        h = float(min(cosine_distance(iv, c) for c in cents))
-        heapq.heappush(open_list, Node(label, None, 0.0, h, "class"))
-
-    while open_list:
-        cur = heapq.heappop(open_list)
-
-        if cur.node_type == "centroid":
-            return cur.label, cur.g
-
-        for cent in centroids_dict[cur.label]:
-            g = float(cosine_distance(iv, cent))
-            heapq.heappush(open_list, Node(cur.label, cent, g, 0.0, "centroid"))
-
-    return None, float("inf")
+    index = SketchIndex.__new__(SketchIndex)
+    index.prototypes = prototypes
+    index.centroids  = centroids_dict
+    clf = SketchClassifier(index)
+    return clf.predict(input_vector)
 
 
-# ─────────────────────────────────────────────────────────────────
-# Ensemble top-K  ← KEY accuracy improvement
-# ─────────────────────────────────────────────────────────────────
-def ensemble_top_k(input_vector, prototypes, centroids_dict, k=3):
-    """
-    Combines THREE signals for each class, then rank-aggregates:
-
-      1. Centroid score  – best (min) cosine distance to any centroid
-      2. Prototype score – cosine distance to the class mean vector
-      3. Top-5 mean      – average distance to the 5 nearest centroids
-                          (rewards classes with *dense* nearby clusters,
-                           penalises lucky single-centroid matches)
-
-    Each signal is ranked 1…N independently.  Final rank = sum of three
-    ranks (Borda count).  The class with the lowest total rank wins.
-
-    Why this works:
-    - Centroid score alone can be fooled by a single outlier centroid
-      that happens to be close (e.g. an unusual sun drawing matching a
-      circle centroid).
-    - Prototype score adds a global "is this the right neighbourhood?"
-      check.
-    - Top-5 mean punishes classes that only have one close centroid and
-      rewards classes with a whole cluster nearby — much more reliable
-      for visually rich categories like flower, cat, guitar.
-    """
-    iv = input_vector / (np.linalg.norm(input_vector) + 1e-8)
-    labels = list(centroids_dict.keys())
-
-    centroid_scores  = {}
-    prototype_scores = {}
-    top5_mean_scores = {}
-
-    for label in labels:
-        cents = centroids_dict[label]
-        dists = sorted(cosine_distance(iv, c) for c in cents)
-
-        centroid_scores[label]  = dists[0]
-        prototype_scores[label] = cosine_distance(iv, prototypes[label])
-        top5_mean_scores[label] = float(np.mean(dists[:5]))
-
-    def ranks(score_dict):
-        sorted_labels = sorted(score_dict, key=score_dict.get)
-        return {lbl: i for i, lbl in enumerate(sorted_labels)}
-
-    r1 = ranks(centroid_scores)
-    r2 = ranks(prototype_scores)
-    r3 = ranks(top5_mean_scores)
-
-    borda = {lbl: r1[lbl] + r2[lbl] + r3[lbl] for lbl in labels}
-    sorted_labels = sorted(borda, key=borda.get)
-
-    # Return (label, cosine_distance) pairs for top-k
-    return [(lbl, centroid_scores[lbl]) for lbl in sorted_labels[:k]]
-
-
-# ─────────────────────────────────────────────────────────────────
-# Convenience wrappers
-# ─────────────────────────────────────────────────────────────────
 def a_star_top_k(input_vector, prototypes, centroids_dict, k=3):
-    """Public wrapper used by main.py predict functions."""
-    return ensemble_top_k(input_vector, prototypes, centroids_dict, k=k)
+    index = SketchIndex.__new__(SketchIndex)
+    index.prototypes = prototypes
+    index.centroids  = centroids_dict
+    clf = SketchClassifier(index)
+    return clf.predict_top_k(input_vector, k)
